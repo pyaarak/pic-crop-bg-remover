@@ -3,7 +3,7 @@
 FROM python:3-alpine
 
 # Create and change to the app directory.
-WORKDIR /app
+WORKDIR /
 
 # Copy local code to the container image.
 COPY . .
