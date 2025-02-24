@@ -2,4 +2,4 @@
  uvicorn main:app --reload
  
 # TO INSTALL DEPENDENCIES
-  pip install -r requirements.txt
+  pip install -r requirement.txt
