@@ -73,7 +73,7 @@ async def crop_face(file: UploadFile = File(...)):
         # Paste onto the light blue background
         final_image.paste(face_resized, (paste_x, paste_y), mask=face_resized.split()[3])
 
-        react_size = (193, 193)  # Rounded for better scaling
+        react_size = (600, 600)  # Rounded for better scaling
         resized_for_react = final_image.resize(react_size, Image.Resampling.LANCZOS)
 
 
