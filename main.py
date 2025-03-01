@@ -22,7 +22,7 @@ app.add_middleware(
 
 
 
-model = YOLO("yolov8x-face.pt")  # Use a custom-trained face model
+model = YOLO("yolov8n-face.pt")  # Use a custom-trained face model
 # modelRemove = YOLO("yolov8n-seg.pt")  # Use a custom-trained face model
 
 
