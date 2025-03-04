@@ -51,8 +51,8 @@ def apply_studio_editing(image: Image):
     enhancer = ImageEnhance.Brightness(image)
     image = enhancer.enhance(1.1)  # Increase brightness by 10%
 
-    enhancer = ImageEnhance.Contrast(image)
-    image = enhancer.enhance(1.1)  # Increase contrast by 20%
+    enhancer = ImageEnhance.Contrast(image) #1.1
+    image = enhancer.enhance(1.0)  # Increase contrast by 20%
 
     # Sharpen the image
     enhancer = ImageEnhance.Sharpness(image)
@@ -62,8 +62,8 @@ def apply_studio_editing(image: Image):
     image = image.filter(ImageFilter.SMOOTH_MORE)
 
     # Adjust saturation
-    enhancer = ImageEnhance.Color(image)
-    image = enhancer.enhance(1.1)  # Increase saturation by 10%
+    enhancer = ImageEnhance.Color(image) #(1.1)
+    image = enhancer.enhance(1.0)  # Increase saturation by 10%
 
     return image
 
@@ -522,9 +522,11 @@ async def remove_bg(file: UploadFile = File(...)):
         return Response(content=f"Error: {str(e)}", status_code=500)
 
 # Pydantic model for creating a payment intent
-class CreatePaymentIntentRequest(BaseModel):
-    amount: int  # Amount in the smallest currency unit (e.g., cents for USD)
-    currency: str = "usd"
+class PaymentRequest(BaseModel):
+    amount: int
+    currency: str
+    email: str
+    phone: str
 
 # Pydantic model for confirming a payment
 class ConfirmPaymentRequest(BaseModel):
@@ -532,19 +534,62 @@ class ConfirmPaymentRequest(BaseModel):
     payment_method: str  # Payment Method ID from the client
 
 @app.post("/create-payment-intent")
-async def create_payment_intent(payment_request: CreatePaymentIntentRequest):
-    """
-    Create a Stripe Payment Intent.
-    """
+async def create_payment_intent(payment_request: PaymentRequest):
     try:
-        # Create a Payment Intent
+        # Create a PaymentIntent with metadata
         intent = stripe.PaymentIntent.create(
             amount=payment_request.amount,
             currency=payment_request.currency,
+            receipt_email=payment_request.email,  # Send receipt to this email
+            metadata={
+                "email": payment_request.email,
+                "phone": payment_request.phone,
+            },
         )
         return {"client_secret": intent["client_secret"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/create-and-send-invoice/")
+async def create_and_send_invoice(email: str, name: str = "Unknown User", amount: int = 5000):
+    try:
+        # Step 1: Check if customer exists
+        customers = stripe.Customer.list(email=email)
+        if customers.data:
+            customer = customers.data[0]  # Use existing customer
+        else:
+            # Step 2: Create customer if not exists
+            customer = stripe.Customer.create(email=email, name=name)
+
+        # Step 3: Create an Invoice Item
+        stripe.InvoiceItem.create(
+            customer=customer.id,
+            amount=amount,  # Amount in cents
+            currency="usd",
+            description="Photo maker invoice"
+        )
+
+        # Step 4: Create an Invoice
+        invoice = stripe.Invoice.create(
+            customer=customer.id,
+            auto_advance=True  # Automatically finalize the invoice
+        )
+
+        # Step 5: Finalize & Send the Invoice
+        stripe.Invoice.finalize_invoice(invoice.id)
+        stripe.Invoice.send_invoice(invoice.id)
+
+        return {
+            "message": "Invoice sent successfully",
+            "customer_id": customer.id,
+            "invoice_id": invoice.id,
+            "amount": amount / 100,
+            "currency": "USD",
+        }
+
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
+
 
 @app.post("/confirm-payment")
 async def confirm_payment(confirm_request: ConfirmPaymentRequest):
