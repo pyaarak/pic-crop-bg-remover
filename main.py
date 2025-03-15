@@ -10,6 +10,7 @@ import torch
 from mtcnn import MTCNN
 import stripe
 from pydantic import BaseModel
+import zipfile
 
 app = FastAPI()
 
@@ -44,6 +45,116 @@ modelFace = YOLO("yolov8n-face.pt")   # Face detection model
 # Load FaceNet's MTCNN detector
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 face_detector = MTCNN()
+
+LAYOUTS = {
+    "2_images_2_rows": {
+        "canvas_size": (2100, 3000),  # 2 images, 1 per row (1200, 2400)
+        "image_positions": [(450, 295), (450, 1505)],
+    },
+    "6_images_2_rows": {
+        "canvas_size": (3600, 2400),  # 6 images, 3 per row
+        "image_positions": [
+            (0, 0), (1200, 0), (2400, 0),
+            (0, 1200), (1200, 1200), (2400, 1200),
+        ],
+    },
+    "6_images_2_rows_7X5": {
+        "canvas_size": (4200, 3000),  # 6 images, 3 per row (3600, 2400) (594 / 2, 598 /2) (297, 299)
+        "image_positions": [
+            (297, 299), (1499, 299), (2701, 299),
+            (297, 1501), (1499, 1501), (2701, 1501),
+        ],
+    },
+    "20_images_4_rows": {
+        "canvas_size": (6600, 5100),  # 20 images, 5 per row (6000, 4800) (592 / 2, 292)
+        "image_positions": [
+            (296, 146), (1498, 146), (2700, 146), (3902, 146), (5104, 146),
+            (296, 1348), (1498, 1348), (2700, 1348), (3902, 1348), (5104, 1348),
+            (296, 2550), (1498, 2550), (2700, 2550), (3902, 2550), (5104, 2550),
+            (296, 3752), (1498, 3752), (2700, 3752), (3902, 3752), (5104, 3752),
+        ],
+    },
+    "20_images_4_rows_sheet_A4": {
+        "canvas_size": (7016, 4961),  # 20 images, 5 per row (6000, 4800) (1016 / 2, 161) (1008 / 2, 155 / 2) (504, 77)
+        "image_positions": [
+            (504, 77), (1706, 77), (2908, 77), (4110, 77), (5312, 77),
+            (504, 1279), (1706, 1279), (2908, 1279), (4110, 1279), (5312, 1279),
+            (504, 2481), (1706, 2481), (2908, 2481), (4110, 2481), (5312, 2481),
+            (504, 3683), (1706, 3683), (2908, 3683), (4110, 3683), (5312, 3683),
+        ],
+    },
+    "8_images_2_rows": {
+        "canvas_size": (4961, 3496),  # 8 images, 4 per row (4800, 2400) (+161, +1096) (155 /2, 1094/2)
+        "image_positions": [
+            (77, 547), (1279, 547), (2481, 547), (3683, 547),
+            (77, 1749), (1279, 1749), (2481, 1749), (3683, 1749),
+        ],
+    },
+    "28_images_4_rows": {
+        "canvas_size": (8400, 5100),  # 28 images, 7 per row (8400, 4800) (0, 300) ()
+        "image_positions": [
+            (0, 146), (1200, 146), (2400, 146), (3600, 146), (4800, 146), (6000, 146), (7200, 146),
+            (0, 1348), (1200, 1348), (2400, 1348), (3600, 1348), (4800, 1348), (6000, 1348), (7200, 1348),
+            (0, 2550), (1200, 2550), (2400, 2550), (3600, 2550), (4800, 2550), (6000, 2550), (7200, 2550),
+            (0, 3752), (1200, 3752), (2400, 3752), (3600, 3752), (4800, 3752), (6000, 3752), (7200, 3752),
+        ],
+    },
+}
+
+def create_printable_sheet(images, layout):
+    canvas_size = layout["canvas_size"]
+    positions = layout["image_positions"]
+    sheet = Image.new("RGB", canvas_size, (207, 207, 209))
+    
+    for img, pos in zip(images, positions):
+        sheet.paste(img, pos)
+    
+    return sheet
+
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    try:
+        # Read uploaded image
+        contents = await file.read()
+        img = Image.open(io.BytesIO(contents))
+        passport_background = img.resize((1198, 1198), Image.LANCZOS)
+
+        printable_sheets = {}
+        for layout_name, layout in LAYOUTS.items():
+            images = [passport_background] * len(layout["image_positions"])
+            printable_sheets[layout_name] = create_printable_sheet(images, layout)
+
+        single_hd_image = passport_background
+        single_hd_compressed = passport_background.copy()
+        
+        single_hd_compressed_byte_arr = io.BytesIO()
+        single_hd_compressed.save(single_hd_compressed_byte_arr, format="PNG", quality=100)
+        single_hd_compressed_byte_arr.seek(0)
+
+        img_byte_arrs = {}
+        for layout_name, sheet in printable_sheets.items():
+            img_byte_arr = io.BytesIO()
+            sheet.save(img_byte_arr, format="PNG")
+            img_byte_arr.seek(0)
+            img_byte_arrs[layout_name] = img_byte_arr.getvalue()
+
+        single_hd_byte_arr = io.BytesIO()
+        single_hd_image.save(single_hd_byte_arr, format="PNG")
+        single_hd_byte_arr.seek(0)
+        img_byte_arrs["single_hd_image"] = single_hd_byte_arr.getvalue()
+        img_byte_arrs["single_hd_compressed"] = single_hd_compressed_byte_arr.getvalue()
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as zip_file:
+            for name, img_bytes in img_byte_arrs.items():
+                zip_file.writestr(f"{name}.png", img_bytes)
+        zip_buffer.seek(0)
+
+        return Response(content=zip_buffer.getvalue(), media_type="application/zip", headers={"Content-Disposition": "attachment; filename=printable_sheets.zip"})
+    
+    except Exception as e:
+        print(e)
+        return Response(content=f"Error: {str(e)}", status_code=500)
 
 
 def apply_studio_editing(image: Image):
