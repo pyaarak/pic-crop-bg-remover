@@ -129,18 +129,18 @@ async def upload_image(file: UploadFile = File(...)):
         single_hd_compressed = passport_background_1200.copy()
         
         single_hd_compressed_byte_arr = io.BytesIO()
-        single_hd_compressed.save(single_hd_compressed_byte_arr, format="PNG", quality=85)
+        single_hd_compressed.save(single_hd_compressed_byte_arr, format="PNG", quality=50, optimize=True, progressive=True)
         single_hd_compressed_byte_arr.seek(0)
 
         img_byte_arrs = {}
         for layout_name, sheet in printable_sheets.items():
             img_byte_arr = io.BytesIO()
-            sheet.save(img_byte_arr, format="PNG")
+            sheet.save(img_byte_arr, format="PNG", quality=100)
             img_byte_arr.seek(0)
             img_byte_arrs[layout_name] = img_byte_arr.getvalue()
 
         single_hd_byte_arr = io.BytesIO()
-        single_hd_image.save(single_hd_byte_arr, format="PNG")
+        single_hd_image.save(single_hd_byte_arr, format="PNG",quality=100)
         single_hd_byte_arr.seek(0)
         img_byte_arrs["single_hd_image"] = single_hd_byte_arr.getvalue()
         img_byte_arrs["single_hd_compressed"] = single_hd_compressed_byte_arr.getvalue()
