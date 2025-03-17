@@ -11,6 +11,10 @@ from mtcnn import MTCNN
 import stripe
 from pydantic import BaseModel
 import zipfile
+from pillow_heif import register_heif_opener
+
+# Register HEIC format with Pillow
+register_heif_opener()
 
 app = FastAPI()
 
@@ -285,6 +289,26 @@ def remove_shadows_clahe(image):
     result_pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
 
     return result_pil
+
+@app.post("/convert-heic-to-jpeg")
+async def convert_heic_to_jpeg(file: UploadFile = File(...)):
+    try:
+        # Open the HEIC image
+        image = Image.open(file.file).convert("RGB")  # Convert to RGB for JPEG format
+        
+        # Save as JPEG in memory
+        img_bytes = io.BytesIO()
+        image.save(img_bytes, format="JPEG", quality=100)
+        img_bytes.seek(0)
+
+        # Return JPEG file as response
+        return Response(content=img_bytes.getvalue(), media_type="image/jpeg", status_code=200)
+    
+    except Exception as e:
+        print(e)
+        return {"error": str(e)}
+
+
 
 @app.post("/process-image")
 async def process_image(file: UploadFile = File(...)):
