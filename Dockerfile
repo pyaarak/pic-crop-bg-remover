@@ -8,6 +8,9 @@ WORKDIR /
 # Copy local code to the container image.
 COPY . .
 
+# Install system dependencies for dlib
+RUN apt-get update && apt-get install -y cmake g++ make
+
 # Install project dependencies
 RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
