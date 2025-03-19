@@ -9,6 +9,7 @@ WORKDIR /
 COPY . .
 
 # Install project dependencies
+RUN pip install --upgrade pip
 RUN pip install -r requirements.txt
 
 # Run the web service on container startup.
