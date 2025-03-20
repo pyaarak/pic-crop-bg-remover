@@ -46,7 +46,7 @@ app.add_middleware(
 # modelFace = YOLO("yolov8n-face.pt")   # Face detection model
 
 # Load FaceNet's MTCNN detector
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 face_detector = MTCNN()
 
 LAYOUTS = {
