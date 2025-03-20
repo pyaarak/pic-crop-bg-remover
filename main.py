@@ -11,6 +11,9 @@ import stripe
 from pydantic import BaseModel
 import zipfile
 from pillow_heif import register_heif_opener
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 # Register HEIC format with Pillow
 register_heif_opener()
