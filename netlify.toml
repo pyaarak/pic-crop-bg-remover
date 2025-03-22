@@ -3,6 +3,9 @@
   functions = "functions"
   publish = "."
 
+[build.environment]
+  PYTHON_VERSION = "3.12"
+
 [[redirects]]
   from = "/*"
   to = "/.netlify/functions/main"
