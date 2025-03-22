@@ -10,7 +10,6 @@ import stripe
 from pydantic import BaseModel
 import zipfile
 from pillow_heif import register_heif_opener
-from mangum import Mangum
 
 
 # Register HEIC format with Pillow
@@ -749,5 +748,3 @@ async def confirm_payment(confirm_request: ConfirmPaymentRequest):
 @app.get("/")
 async def check():
     return "hii"
-
-handler = Mangum(app)
