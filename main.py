@@ -5,15 +5,13 @@ import cv2
 from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
 import io
-import torch
 from mtcnn import MTCNN
 import stripe
 from pydantic import BaseModel
 import zipfile
 from pillow_heif import register_heif_opener
-import os
+from mangum import Mangum
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 # Register HEIC format with Pillow
 register_heif_opener()
@@ -751,3 +749,5 @@ async def confirm_payment(confirm_request: ConfirmPaymentRequest):
 @app.get("/")
 async def check():
     return "hii"
+
+handler = Mangum(app)
