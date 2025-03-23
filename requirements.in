@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+rembg
+opencv-python
+pillow
+numpy
+mtcnn
+stripe
+pydantic
+pillow-heif
+python-multipart
