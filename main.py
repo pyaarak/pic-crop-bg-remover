@@ -5,6 +5,7 @@ import cv2
 from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
 import io
+import torch
 from mtcnn import MTCNN
 import stripe
 from pydantic import BaseModel
@@ -45,7 +46,7 @@ app.add_middleware(
 # modelFace = YOLO("yolov8n-face.pt")   # Face detection model
 
 # Load FaceNet's MTCNN detector
-# device = torch.device("cpu")
+device = torch.device("cpu")
 face_detector = MTCNN()
 
 LAYOUTS = {

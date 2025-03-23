@@ -1,11 +1,7 @@
-fastapi
-uvicorn
-rembg
-opencv-python
-pillow
-numpy
-mtcnn
+pillow_heif
 stripe
-pydantic
-pillow-heif
-python-multipart
+mtcnn
+torch
+opencv-python 
+rembg
+fastapi
