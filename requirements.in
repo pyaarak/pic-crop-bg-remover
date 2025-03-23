@@ -7,3 +7,4 @@ rembg
 fastapi
 uvicorn
 numpy
+onnxruntime
