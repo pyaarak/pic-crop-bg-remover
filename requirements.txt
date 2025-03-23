@@ -218,7 +218,7 @@ tensorboard-data-server==0.7.2
     # via tensorboard
 tensorflow==2.19.0
     # via -r requirements.in
-tensorflow-io-gcs-filesystem==0.31.0
+# tensorflow-io-gcs-filesystem==0.31.0
     # via tensorflow
 termcolor==2.5.0
     # via tensorflow
