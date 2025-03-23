@@ -5,3 +5,5 @@ torch
 opencv-python 
 rembg
 fastapi
+uvicorn
+numpy
