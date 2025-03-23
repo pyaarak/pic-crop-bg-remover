@@ -25,8 +25,7 @@ stripe.api_key = "sk_test_51Qr89wKNAPxQ8Uyg1W9MHkdkQWdQE0DMTUKxTzGmdVobyHApaUr5r
 # Enable CORS for localhost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Change port if needed
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
