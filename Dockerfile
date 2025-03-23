@@ -9,7 +9,7 @@ WORKDIR /
 COPY . .
 
 # Install system dependencies for dlib
-# RUN apt-get update && apt-get install -y libgl1
+RUN apt-get update && apt-get install -y libgl1
 RUN apt-get update && apt-get install -y cmake g++ make
 
 # Install project dependencies
