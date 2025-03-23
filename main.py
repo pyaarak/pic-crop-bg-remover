@@ -487,9 +487,6 @@ async def confirm_payment(confirm_request: ConfirmPaymentRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-
-
 @app.get("/")
 async def check():
     return "hii"
