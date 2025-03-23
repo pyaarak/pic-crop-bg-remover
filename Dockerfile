@@ -1,6 +1,6 @@
 # Use the Python 3 alpine official image
 # https://hub.docker.com/_/python
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 # Create and change to the app directory.
 WORKDIR /
@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y cmake g++ make
 
 # Install project dependencies
 RUN pip cache purge
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 8000
 
