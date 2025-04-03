@@ -291,9 +291,22 @@ def remove_shadows_clahe(image):
 
 @app.post("/convert-heic-to-jpeg")
 async def convert_heic_to_jpeg(file: UploadFile = File(...)):
-    try:
-        # Open the HEIC image
-        image = Image.open(file.file).convert("RGB")  # Convert to RGB for JPEG format
+   try:
+         # Check if file is already JPEG
+        if file.filename.lower().endswith(('.jpg', '.jpeg')):
+            # Just return the original file content
+            return Response(
+                content=await file.read(),
+                media_type="image/jpeg",
+                status_code=200
+            )
+        
+        # Only convert if it's HEIC
+        image = Image.open(file.file)
+        
+        # Convert to RGB if needed (HEIC might be in other modes)
+        if image.mode != 'RGB':
+            image = image.convert("RGB")
         
         # Save as JPEG in memory
         img_bytes = io.BytesIO()
@@ -301,12 +314,15 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
         img_bytes.seek(0)
 
         # Return JPEG file as response
-        return Response(content=img_bytes.getvalue(), media_type="image/jpeg", status_code=200)
+        return Response(
+            content=img_bytes.getvalue(),
+            media_type="image/jpeg",
+            status_code=200
+        )
     
     except Exception as e:
         print(e)
         return {"error": str(e)}
-
 
 
 @app.post("/process-image")
