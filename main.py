@@ -291,7 +291,7 @@ def remove_shadows_clahe(image):
 
 @app.post("/convert-heic-to-jpeg")
 async def convert_heic_to_jpeg(file: UploadFile = File(...)):
-   try:
+    try:
          # Check if file is already JPEG
         if file.filename.lower().endswith(('.jpg', '.jpeg')):
             # Just return the original file content
@@ -321,7 +321,6 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
         )
     
     except Exception as e:
-        print(e)
         return {"error": str(e)}
 
 
