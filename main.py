@@ -2,7 +2,7 @@ from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Header, 
 from fastapi.middleware.cors import CORSMiddleware
 from rembg import remove, new_session
 import cv2
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image, ImageFilter, ImageEnhance, ImageOps
 import numpy as np
 import io
 import torch
@@ -295,14 +295,21 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
          # Check if file is already JPEG
         if file.filename.lower().endswith(('.jpg', '.jpeg')):
             # Just return the original file content
+            image = Image.open(file.file)
+            image = ImageOps.exif_transpose(image)
+            img_bytes = io.BytesIO()
+            image.save(img_bytes, format="JPEG", quality=100)
+            img_bytes.seek(0)
+            
             return Response(
-                content=await file.read(),
+                content=img_bytes.getvalue(),
                 media_type="image/jpeg",
                 status_code=200
             )
         
         # Only convert if it's HEIC
         image = Image.open(file.file)
+        image = ImageOps.exif_transpose(image)
         
         # Convert to RGB if needed (HEIC might be in other modes)
         if image.mode != 'RGB':
@@ -321,6 +328,7 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
         )
     
     except Exception as e:
+        print(e)
         return {"error": str(e)}
 
 
