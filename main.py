@@ -297,6 +297,8 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
             # Just return the original file content
             image = Image.open(file.file)
             image = ImageOps.exif_transpose(image)
+            if(image.width > 1200 and image.height > 1600):
+                image = ImageOps.fit(image, (1200,1600), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
             img_bytes = io.BytesIO()
             image.save(img_bytes, format="JPEG", quality=100)
             img_bytes.seek(0)
@@ -310,6 +312,8 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
         # Only convert if it's HEIC
         image = Image.open(file.file)
         image = ImageOps.exif_transpose(image)
+        if(image.width > 1200 and image.height > 1600):
+            image = ImageOps.fit(image, (1200,1600), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
         
         # Convert to RGB if needed (HEIC might be in other modes)
         if image.mode != 'RGB':
@@ -353,10 +357,17 @@ async def process_image(file: UploadFile = File(...)):
         x1, y1, width, height = box
         x2, y2 = x1 + width, y1 + height
 
-        # Add padding (extra space for passport photo)
-        padding_x = int(width * 0.75)
-        padding_y = int(height * 0.45)
-        padding_y_bottom = int(height * 0.5)  # Extra padding below the face to include bod
+        # # Add padding (extra space for passport photo)
+        # padding_x = int(width * 0.75)
+        # padding_y = int(height * 0.45)
+        # padding_y_bottom = int(height * 0.5)  # Extra padding below the face to include bod
+        face_width_ratio = width / input_image.width
+        face_height_ratio = height / input_image.height
+
+        # Adjust padding dynamically based on face proportions and position in the image
+        padding_x = int(width * ((0.75 if face_width_ratio < 0.2 else 1.1-face_width_ratio)))  # Reduce padding if the face is too wide
+        padding_y = int(height * ((0.55 if face_height_ratio <0.3 else 0.45)))  # Adjust forehead space
+        padding_y_bottom = int(height * (0.6 if face_height_ratio > 0.7 else 0.5))  # Adjust body space
 
         x1 = max(0, x1 - padding_x)
         x2 = min(input_image.width, x2 + padding_x)
