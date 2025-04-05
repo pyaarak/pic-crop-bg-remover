@@ -289,6 +289,83 @@ def remove_shadows_clahe(image):
 
     return result_pil
 
+def apply_studio(image):
+
+    img_array = np.array(image.convert("RGB"))
+    smooth = cv2.bilateralFilter(img_array, d=9, sigmaColor=75, sigmaSpace=75)
+
+    # Step 2: Increase brightness & contrast slightly
+    lab = cv2.cvtColor(smooth, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    enhanced = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB)
+
+    # Step 3: Slight sharpening (to pop eyes/lips)
+    sharpen_kernel = np.array([[0, -1, 0],
+                               [-1, 5, -1],
+                               [0, -1, 0]])
+    sharpened = cv2.filter2D(enhanced, -1, sharpen_kernel)
+    return Image.fromarray(sharpened)
+
+def remove_hair_feathers(image):
+
+    img_array = np.array(image)
+    if img_array.shape[2] != 4:
+        raise ValueError("Image must have 4 channels (RGBA)")
+
+    rgb = img_array[:, :, :3]
+    alpha = img_array[:, :, 3]
+
+    # Composite over white for realistic processing
+    white_bg = np.full_like(rgb, 255)
+    alpha_norm = alpha.astype(np.float32) / 255.0
+    comp_rgb = (rgb * alpha_norm[..., None] + white_bg * (1 - alpha_norm[..., None])).astype(np.uint8)
+
+    # Grayscale and light blur
+    gray = cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    # Softer edge detection
+    edges = cv2.Canny(blurred, 15, 60)
+
+    # Detect light and slightly dark stray hair regions
+    mask_light = cv2.inRange(gray, 150, 255)
+    mask_dark = cv2.inRange(gray, 60, 150)
+    stray_zone = cv2.bitwise_or(mask_light, mask_dark)
+
+    # Focus on top of head
+    h, w = gray.shape
+    top_mask = np.zeros_like(gray)
+    top_h = int(h * 0.3)
+    top_mask[:top_h, :] = 255
+    stray_top = cv2.bitwise_and(edges, stray_zone)
+    stray_top = cv2.bitwise_and(stray_top, top_mask)
+
+    # Remove dense/solid hair regions
+    dense_hair_mask = cv2.inRange(gray, 50, 130)
+    stray_top = cv2.bitwise_and(stray_top, cv2.bitwise_not(dense_hair_mask))
+
+    # Smooth the mask
+    kernel = np.ones((3, 3), np.uint8)
+    stray_top = cv2.dilate(stray_top, kernel, iterations=1)
+    stray_top = cv2.morphologyEx(stray_top, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # Large feathering for smooth blending
+    feather = cv2.GaussianBlur(stray_top, (7, 7), 0)
+    blend_mask = (feather.astype(np.float32) / 255.0)[:, :, None]  # shape (h, w, 1)
+
+     # Step 4: Studio blend — fade slightly toward white
+    white_fade = (comp_rgb * (1 - blend_mask) + 255 * blend_mask).astype(np.uint8)
+
+    # Step 5: Restore alpha channel
+    result = np.dstack((white_fade, alpha))
+    # result = np.dstack((blended_rgb, alpha))
+
+    return Image.fromarray(result)
+
+
 @app.post("/convert-heic-to-jpeg")
 async def convert_heic_to_jpeg(file: UploadFile = File(...)):
     try:
@@ -383,8 +460,11 @@ async def process_image(file: UploadFile = File(...)):
         # Remove background using Rembg
         no_bg_image = remove(cropped_face)
 
+        no_hair_image = remove_hair_feathers(no_bg_image)
+
          # Smooth edges to remove shadows
-        smoothed_image = feather_edges(no_bg_image)
+        smoothed_image = feather_edges(no_hair_image)
+        
 
         # Resize to passport size (600x600 pixels for 2x2 inches at 300 DPI)
         face_resized = smoothed_image.resize((1200, 1200), Image.LANCZOS)
@@ -396,6 +476,9 @@ async def process_image(file: UploadFile = File(...)):
         # Center the face on the background
         paste_x = (1200 - face_resized.width) // 2
         paste_y = (1200 - face_resized.height) // 2
+
+        face_resized = face_resized.convert("RGBA")
+        
         passport_background.paste(face_resized, (paste_x, paste_y), face_resized.split()[3])
 
         # Apply studio-like enhancements
