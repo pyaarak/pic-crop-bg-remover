@@ -433,9 +433,9 @@ def get_makepassport_crop_coords(image, landmarks,  extra_bottom_pad_ratio=0.2,
     face_height = landmarks['box'][3]
     
     # MakePassport.com's proprietary padding formula
-    top_padding = int(face_height * 0.45 * (1 - reduce_top_pad_ratio) * 1.2)  # Forehead space
-    bottom_padding = int(face_height * 0.6 *(1 + extra_bottom_pad_ratio) * 1.2)  # Chin to shoulder
-    side_padding = int(face_width * 0.75 * 1.2)   # Side space
+    top_padding = int(face_height * 0.45 * (1 - reduce_top_pad_ratio) * 1.1)  # Forehead space
+    bottom_padding = int(face_height * 0.6 *(1 + extra_bottom_pad_ratio) * 1.1)  # Chin to shoulder
+    side_padding = int(face_width * 0.75 * 1.1)   # Side space
     
     # Calculate crop coordinates
     x1 = max(0, landmarks['box'][0] - side_padding)
