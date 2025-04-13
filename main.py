@@ -357,14 +357,15 @@ def remove_hair_feathers(image):
     blend_mask = (feather.astype(np.float32) / 255.0)[:, :, None]  # shape (h, w, 1)
 
      # Step 4: Studio blend — fade slightly toward white
-    white_fade = (comp_rgb * (1 - blend_mask) + 255 * blend_mask).astype(np.uint8)
+    # white_fade = (comp_rgb * (1 - blend_mask) + 255 * blend_mask).astype(np.uint8)
+    new_alpha = (alpha * (1 - blend_mask.squeeze())).astype(np.uint8)
 
     # Step 5: Restore alpha channel
-    result = np.dstack((white_fade, alpha))
+    result = np.dstack((rgb, new_alpha))
     # result = np.dstack((blended_rgb, alpha))
 
     return Image.fromarray(result)
-
+ 
 
 @app.post("/convert-heic-to-jpeg")
 async def convert_heic_to_jpeg(file: UploadFile = File(...)):
@@ -412,6 +413,57 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
         print(e)
         return {"error": str(e)}
 
+def smooth_skin(pil_img):
+    img_np = np.array(pil_img)
+    blurred = cv2.bilateralFilter(img_np, 9, 75, 75)
+    mask = np.zeros(img_np.shape, dtype=np.float32)
+    cv2.illuminationChange(img_np, blurred, mask=mask, alpha=0.2, beta=0.4)
+    smoothed = cv2.addWeighted(img_np, 0.8, blurred, 0.2, 0)
+    return Image.fromarray(smoothed)
+
+def get_makepassport_crop_coords(image, landmarks,  extra_bottom_pad_ratio=0.2,
+                            reduce_top_pad_ratio=0.1):
+    """
+    Exact passport photo cropping logic matching MakePassport.com
+    Returns (x1, y1, x2, y2) cropping coordinates
+    """
+    # Get face dimensions
+    width, height = image.size
+    face_width = landmarks['box'][2]
+    face_height = landmarks['box'][3]
+    
+    # MakePassport.com's proprietary padding formula
+    top_padding = int(face_height * 0.45 * (1 - reduce_top_pad_ratio) * 1.2)  # Forehead space
+    bottom_padding = int(face_height * 0.6 *(1 + extra_bottom_pad_ratio) * 1.2)  # Chin to shoulder
+    side_padding = int(face_width * 0.75 * 1.2)   # Side space
+    
+    # Calculate crop coordinates
+    x1 = max(0, landmarks['box'][0] - side_padding)
+    x2 = min(width, landmarks['box'][0] + landmarks['box'][2] + side_padding)
+    
+    # Special vertical positioning (eyes at 45% from top)
+    eye_level = landmarks['keypoints']['left_eye'][1]  # Use left eye y-position
+    y1 = max(0, eye_level - int(top_padding * 1.1))  # Adjusted forehead ratio
+    y2 = min(height, eye_level + int(bottom_padding * 0.9))  # Shoulder position
+    
+    # Ensure 1:1 aspect ratio (passport requirement)
+    crop_width = x2 - x1
+    crop_height = y2 - y1
+    
+    if crop_width > crop_height:
+        # Expand vertical
+        diff = crop_width - crop_height
+        y1 = max(0, y1 - diff//2)
+        y2 = min(height, y2 + diff//2)
+    else:
+        # Expand horizontal
+        diff = crop_height - crop_width
+        x1 = max(0, x1 - diff//2)
+        x2 = min(width, x2 + diff//2)
+    
+    return (x1, y1, x2, y2)
+
+
 
 @app.post("/process-image")
 async def process_image(file: UploadFile = File(...)):
@@ -429,45 +481,61 @@ async def process_image(file: UploadFile = File(...)):
             return Response(content="No face detected", status_code=400)
 
         # Extract the first detected face and landmarks
-        box = result[0]['box']
-        landmarks = result[0]['keypoints']
-        x1, y1, width, height = box
-        x2, y2 = x1 + width, y1 + height
+        # box = result[0]['box']
+        # landmarks = result[0]['keypoints']
+        # x1, y1, width, height = box
+        # x2, y2 = x1 + width, y1 + height
 
-        # # Add padding (extra space for passport photo)
-        # padding_x = int(width * 0.75)
-        # padding_y = int(height * 0.45)
-        # padding_y_bottom = int(height * 0.5)  # Extra padding below the face to include bod
-        face_width_ratio = width / input_image.width
-        face_height_ratio = height / input_image.height
-
-        # Adjust padding dynamically based on face proportions and position in the image
-        padding_x = int(width * ((0.75 if face_width_ratio < 0.2 else 1.1-face_width_ratio)))  # Reduce padding if the face is too wide
-        padding_y = int(height * ((0.55 if face_height_ratio <0.3 else 0.45)))  # Adjust forehead space
-        padding_y_bottom = int(height * (0.6 if face_height_ratio > 0.7 else 0.5))  # Adjust body space
-
-        x1 = max(0, x1 - padding_x)
-        x2 = min(input_image.width, x2 + padding_x)
-        y1 = max(0, y1 - padding_y)
-        y2 = min(input_image.height, y2 + padding_y_bottom)
-
-        # Crop the face region
+        x1, y1, x2, y2 = get_makepassport_crop_coords(input_image, result[0])
         cropped_face = input_image.crop((x1, y1, x2, y2))
 
+        # # # Add padding (extra space for passport photo)
+        # # padding_x = int(width * 0.75)
+        # # padding_y = int(height * 0.45)
+        # # padding_y_bottom = int(height * 0.5)  # Extra padding below the face to include bod
+        # face_width_ratio = width / input_image.width
+        # face_height_ratio = height / input_image.height
+
+        # # Adjust padding dynamically based on face proportions and position in the image
+        # padding_x = int(width * ((0.75 if face_width_ratio < 0.2 else 1.1-face_width_ratio)))  # Reduce padding if the face is too wide
+        # padding_y = int(height * ((0.55 if face_height_ratio <0.3 else 0.45)))  # Adjust forehead space
+        # padding_y_bottom = int(height * (0.6 if face_height_ratio > 0.7 else 0.5))  # Adjust body space
+        # Face-to-image ratios
+        # Calculate face-to-image ratios
+        # face_width_ratio = width / input_image.width
+        # face_height_ratio = height / input_image.height
+
+        # # Conservative, uniform padding that avoids oversized face framing
+        # padding_x = int(width * 0.6 if face_width_ratio < 0.3 else width * 0.4)
+        # padding_y = int(height * 0.4 if face_height_ratio < 0.4 else height * 0.35)
+        # padding_y_bottom = int(height * 0.45 if face_height_ratio > 0.6 else height * 0.4)
+
+
+        # x1 = max(0, x1 - padding_x)
+        # x2 = min(input_image.width, x2 + padding_x)
+        # y1 = max(0, y1 - padding_y)
+        # y2 = min(input_image.height, y2 + padding_y_bottom)
+
+        # # Crop the face region
+        # cropped_face = input_image.crop((x1, y1, x2, y2))
+
         # Ensure face and eye positioning meet passport requirements
-        cropped_face = calculate_face_position(cropped_face, landmarks)
+        # cropped_face = calculate_face_position(cropped_face, landmarks)
 
         # Remove background using Rembg
         no_bg_image = remove(cropped_face)
 
-        no_hair_image = remove_hair_feathers(no_bg_image)
+        # Smooth edges to remove shadows
+        smoothed_image = feather_edges(no_bg_image)
 
-         # Smooth edges to remove shadows
-        smoothed_image = feather_edges(no_hair_image)
+        no_hair_image = remove_hair_feathers(smoothed_image)
         
 
         # Resize to passport size (600x600 pixels for 2x2 inches at 300 DPI)
-        face_resized = smoothed_image.resize((1200, 1200), Image.LANCZOS)
+        face_resized = no_hair_image.resize((1200, 1200), Image.LANCZOS)
+        face_resized = face_resized.filter(ImageFilter.UnsharpMask(radius=2, percent=120, threshold=2))
+        # face_resized_np = cv2.resize(np.array(smoothed_image), (1200, 1200), interpolation=cv2.INTER_CUBIC)
+        # face_resized = Image.fromarray(face_resized_np)
 
         # Create a passport-size background (white)
         white_background = (255, 255, 255)
@@ -481,12 +549,14 @@ async def process_image(file: UploadFile = File(...)):
         
         passport_background.paste(face_resized, (paste_x, paste_y), face_resized.split()[3])
 
+        # passport_background = passport_background.filter(ImageFilter.UnsharpMask(radius=2, percent=170, threshold=3))
+
         # Apply studio-like enhancements
         passport_background = apply_studio_editing(passport_background)
 
         # Convert image to bytes
         img_byte_arr = io.BytesIO()
-        passport_background.save(img_byte_arr, format="PNG", quality=100)
+        passport_background.save(img_byte_arr, format="PNG", quality=100, dpi=(300, 300))
         img_byte_arr.seek(0)
 
         return Response(content=img_byte_arr.getvalue(), media_type="image/png", status_code=200)
