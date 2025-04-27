@@ -1,4 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, Response, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from rembg import remove, new_session
 import cv2
@@ -11,19 +12,62 @@ import stripe
 from pydantic import BaseModel
 import zipfile
 from pillow_heif import register_heif_opener
+from gfpgan import GFPGANer
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
+import insightface
+from insightface.app import FaceAnalysis
+from scipy.ndimage import gaussian_filter
+import sys
+sys.path.append("RobustVideoMatting\model")
+from torchvision.transforms import ToTensor
+from RobustVideoMatting.model.model import MattingNetwork
+import torchvision.transforms as transforms
+from MODNet.src.models.modnet import MODNet
+import torch.nn as nn
+from skimage import morphology
+from scipy.ndimage import distance_transform_edt
 
+modelFace = FaceAnalysis(name='buffalo_l')
+modelFace.prepare(ctx_id=0, det_size=(640, 640))
 
-# Register HEIC format with Pillow
+modnet = MODNet(backbone_pretrained=False)
+modnet = nn.DataParallel(modnet)
+modnet.load_state_dict(torch.load('modnet.ckpt', map_location=torch.device('cpu')))
+modnet.eval()
+
+modelMat = MattingNetwork('resnet50')
+modelMat.load_state_dict(torch.load('rvm_resnet50.pth', map_location='cpu'))
+modelMat.eval()
+modelMat.to('cpu')
+
+model = RRDBNet(num_in_ch=3, num_out_ch=3, scale=2, num_feat=64, num_block=23, num_grow_ch=32)
+
+esrgan_model = RealESRGANer(
+    scale=2,
+    model_path='Realtrained.pth',
+    model=model,
+    pre_pad=0,
+    half=False,
+    device='cpu'  
+)
+
 register_heif_opener()
-
 app = FastAPI()
 
-# Set your Stripe API key
-stripe.api_key = "sk_test_51Qr89wKNAPxQ8Uyg1W9MHkdkQWdQE0DMTUKxTzGmdVobyHApaUr5rPoyFQZ3lULut3swkD8dysoIe34n3LoV4VSI00HpJn9d1A"  # Replace with your Stripe secret key
-# webhook_secret = "whsec_XXXXXXXXXXXXXXXXXXXXXXXX"  # Replace with your Stripe webhook secret
+gfpgan_model = GFPGANer(
+    model_path='gftrained.pth',
+    upscale=2,
+    arch='clean',
+    channel_multiplier=2,
+    device='cpu',
+    bg_upsampler=None,
+)
+
+stripe.api_key = "sk_test_51Qr89wKNAPxQ8Uyg1W9MHkdkQWdQE0DMTUKxTimazGmdVobyHApaUr5rPoyFQZ3lULut3swkD8dysoIe34n3LoV4VSI00HpJn9d1A" 
 
 
-# Enable CORS for localhost
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,6 +92,86 @@ app.add_middleware(
 # Load FaceNet's MTCNN detector
 device = torch.device("cpu")
 face_detector = MTCNN()
+
+def get_uk_passport_crop(img, face, final_size=1200,
+                         target_head_ratio=0.69, eye_level_ratio=0.43,
+                         min_side_padding_ratio=0.07, max_side_padding_ratio=0.1,
+                         bottom_extra_ratio=0.20):
+    """
+    Generate a consistent UK biometric crop from SCRFD-detected face.
+    - Ensures head is ~69% of image height
+    - Eyes ~43% from top
+    - Adds shoulder/body space if possible
+    - Dynamically adapts to tight framing or excess space
+    """
+    h, w = img.shape[:2]
+
+    bbox = face.bbox.astype(int)
+    kps = face.kps
+
+    face_x1, face_y1, face_x2, face_y2 = bbox
+    face_w = face_x2 - face_x1
+    face_h = face_y2 - face_y1
+
+    # Estimate top of head from bbox (20% above)
+    top_of_head_y = face_y1 - int(0.2 * face_h)
+    top_of_head_y = max(0, top_of_head_y)
+
+    chin_y = face_y2
+    actual_head_height = chin_y - top_of_head_y
+
+    # Get eye Y position
+    eye_y = int((kps[0][1] + kps[1][1]) / 2)
+
+    desired_head_px = int(final_size * target_head_ratio)
+    scale = desired_head_px / actual_head_height
+
+    # Initial crop dimensions
+    crop_h = final_size / scale
+    crop_w = crop_h
+
+    # Horizontal padding based on face position and space
+    face_cx = (face_x1 + face_x2) // 2
+    available_left = face_cx
+    available_right = w - face_cx
+    min_space = min(available_left, available_right)
+    face_half_width = face_w / 2
+    max_pad_ratio = min(max_side_padding_ratio, min_space / face_half_width)
+    side_padding_ratio = min(max_pad_ratio, max_side_padding_ratio)
+    side_padding_ratio = max(side_padding_ratio, min_side_padding_ratio)
+
+    crop_w *= (1 + side_padding_ratio * 2)
+    crop_h *= (1 + bottom_extra_ratio)
+
+    # Compute Y (vertical) crop origin using eye alignment
+    eye_target_y = eye_level_ratio * final_size
+    crop_y1 = eye_y - (eye_target_y / final_size) * crop_h
+    crop_y2 = crop_y1 + crop_h
+
+    # Compute X (horizontal) crop origin using center alignment
+    crop_x1 = face_cx - crop_w / 2
+    crop_x2 = crop_x1 + crop_w
+
+    # Clamp to image
+    crop_x1 = max(0, crop_x1)
+    crop_y1 = max(0, crop_y1)
+    crop_x2 = min(w, crop_x1 + crop_w)
+    crop_y2 = min(h, crop_y1 + crop_h)
+
+    # Adjust again if image edge prevents full crop
+    if crop_x2 - crop_x1 < crop_w:
+        crop_x1 = max(0, crop_x2 - crop_w)
+    if crop_y2 - crop_y1 < crop_h:
+        crop_y1 = max(0, crop_y2 - crop_h)
+
+    # Final crop box as integers
+    x1, y1, x2, y2 = map(int, [crop_x1, crop_y1, crop_x2, crop_y2])
+    cropped = img[y1:y2, x1:x2]
+
+    # Resize to output size
+    output = cv2.resize(cropped, (final_size, final_size), interpolation=cv2.INTER_LANCZOS4)
+    return output
+
 
 LAYOUTS = {
     "Printable_3.5x5": {
@@ -117,7 +241,6 @@ def create_printable_sheet(images, layout):
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     try:
-        # Read uploaded image
         contents = await file.read()
         img = Image.open(io.BytesIO(contents))
         passport_background = img.resize((1198, 1198), Image.LANCZOS)
@@ -161,54 +284,276 @@ async def upload_image(file: UploadFile = File(...)):
         return Response(content=f"Error: {str(e)}", status_code=500)
 
 
+def force_shirt_region_smart(alpha_np, strength=0.95, min_existing_alpha=0.4):
+    h, w = alpha_np.shape
+    bottom_mask = np.zeros_like(alpha_np)
+    bottom_mask[int(h * 0.4):, :] = 1 
+
+    boosted_alpha = np.where(
+        (bottom_mask == 1) & (alpha_np > min_existing_alpha),
+        np.maximum(alpha_np, strength),
+        alpha_np
+    )
+    return boosted_alpha
+
+def boost_shirt_alpha(alpha_np, strength=0.95):
+    h, w = alpha_np.shape
+    bottom_mask = np.zeros_like(alpha_np)
+    bottom_mask[int(h * 0.4):, :] = 1 
+
+    boosted = np.where(bottom_mask == 1, 
+                       np.maximum(alpha_np, strength), 
+                       alpha_np)
+    return boosted
+
+def repair_alpha_matte(alpha_np):
+    alpha_uint8 = (alpha_np * 255).astype(np.uint8)
+    _, binary = cv2.threshold(alpha_uint8, 40, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    dilated = cv2.dilate(closed, kernel, iterations=1)
+    blurred = cv2.GaussianBlur(dilated, (7, 7), 0)
+    repaired_alpha = blurred.astype(np.float32) / 255.0
+    repaired_alpha = np.clip(repaired_alpha, 0, 1)
+
+    return repaired_alpha
+
+def advanced_clean_rvm_alpha(pha, threshold=0.85, min_area=1500, feather_radius=25, fill_holes_radius=25):
+    pha = np.clip(pha * 1.2, 0, 1)
+    binary = (pha > threshold).astype(np.uint8) * 255
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+
+    for i in range(1, num_labels): 
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, np.ones((fill_holes_radius, fill_holes_radius), np.uint8))
+    cleaned = cv2.GaussianBlur(cleaned, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+    kernel = np.ones((3, 3), np.uint8)
+    cleaned = cv2.dilate(cleaned, kernel, iterations=1)
+    cleaned = cv2.erode(cleaned, kernel, iterations=1)
+    cleaned = cleaned.astype(np.float32) / 255.0
+    return cleaned
+
+
+
+def remove_bg_rvm_cpu(image: Image.Image, model=modelMat):
+    frame = ToTensor()(image).unsqueeze(0).to("cpu")
+    rec = [None] * 4
+    downsample_ratio = torch.tensor([[1]], dtype=torch.float32).to("cpu")
+    with torch.no_grad():
+        fgr, pha, *_ = model(frame, *rec, downsample_ratio)
+
+    fgr = fgr[0].permute(1, 2, 0).cpu().numpy()
+    pha = pha[0, 0].cpu().numpy()
+    pha = clean_alpha_mask(pha)
+    pha = repair_alpha_matte(pha)
+    pha = boost_shirt_alpha(pha, strength=0.95)
+    pha = final_small_patch_cleaner(pha, min_area=500)
+    comp = fgr * pha[..., None] + (1 - pha[..., None]) * 1
+    comp_img = Image.fromarray((comp * 255).astype(np.uint8))
+
+    return comp_img
+
+def final_small_patch_cleaner(alpha_np, min_area=500):
+    alpha_uint8 = (alpha_np * 255).astype(np.uint8)
+    _, binary = cv2.threshold(alpha_uint8, 128, 255, cv2.THRESH_BINARY)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    cleaned = np.zeros_like(binary)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            cleaned[labels == i] = 255
+    cleaned = cv2.GaussianBlur(cleaned, (5, 5), 0) 
+    cleaned = cleaned.astype(np.float32) / 255.0
+    cleaned = np.clip(cleaned, 0, 1)
+
+    return cleaned
+
+
+def clean_stray_hair_with_morph(matte, kernel_size=15, iterations=3):
+    binary = (matte > 0.4).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_size))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+    cleaned = opened.astype(np.float32) * matte
+    return cleaned
+
+def suppress_vertical_strays(matte, min_height_ratio=0.15, width_threshold=10):
+    h, w = matte.shape
+    binary = (matte > 0.3).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    for i in range(1, num_labels):
+        x, y, bw, bh, area = stats[i]
+        if bh > h * min_height_ratio and bw < width_threshold:
+            matte[labels == i] = 0
+    return matte
+
+
+
+def soften_matte_edges(matte, sigma=1.5):
+    return gaussian_filter(matte, sigma=sigma)
+
+def extract_main_head_mask(matte, min_area_ratio=0.05):
+    h, w = matte.shape
+    binary = (matte > 0.5).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA]) 
+    mask = (labels == largest_label).astype(np.float32)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    return mask
+
+def directional_top_suppression(matte, height_ratio=0.25, center_weight=1.0, edge_weight=0.0, center_protect_ratio=0.4):
+    h, w = matte.shape
+    fade_height = int(h * height_ratio)
+    vertical = np.linspace(edge_weight, center_weight, fade_height).reshape(-1, 1)
+    x = np.linspace(-1, 1, w)
+    horizontal = 1 - np.abs(x)
+    horizontal = horizontal * (center_weight - edge_weight) + edge_weight
+    fade_mask = vertical @ horizontal[None, :]
+    full_mask = np.ones_like(matte)
+    full_mask[:fade_height, :] = fade_mask
+    protect_width = int(w * center_protect_ratio)
+    cx = w // 2
+    full_mask[:fade_height, cx - protect_width//2 : cx + protect_width//2] = 1.0
+
+    return matte * full_mask
+
+def remove_bg_modnet(image: Image.Image, modnet=modnet):
+    try:
+        transform = transforms.Compose([
+            transforms.Resize((512, 512)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        ])
+        input_tensor = transform(image).unsqueeze(0).to('cpu')
+        with torch.no_grad():
+            result = modnet(input_tensor, inference=True)
+            if result[2] is None:
+                raise ValueError("MODNet returned None for the matte tensor.")
+            matte = result[2][0][0].cpu().numpy()
+        matte = Image.fromarray((matte * 255).astype(np.uint8)).resize(image.size, Image.LANCZOS)
+        matte_np = np.array(matte).astype(np.float32) / 255.0
+        matte_np = directional_top_suppression(matte_np, height_ratio=0.25, center_protect_ratio=0.4)
+        matte_np = clean_stray_hair_with_morph(matte_np, kernel_size=15, iterations=3)
+        matte_np = clean_thin_hairs(matte_np, threshold=0.3, max_thickness=3)
+        main_mask = extract_main_head_mask(matte_np)
+        matte_np = matte_np * main_mask
+        matte_np = soften_matte_edges(matte_np, sigma=3.5)
+        foreground = np.array(image).astype(np.float32) / 255.0
+        white_bg = np.ones_like(foreground)
+        comp = foreground * matte_np[..., None] + white_bg * (1 - matte_np[..., None])
+        comp = (comp * 255).astype(np.uint8)
+
+        return Image.fromarray(comp)
+
+    except Exception as e:
+        raise
+
+
+def remove_small_isolated_regions(matte, min_size=500):
+    binary = matte > 0.5
+    cleaned = morphology.remove_small_objects(binary, min_size=min_size)
+    cleaned = morphology.remove_small_holes(cleaned, area_threshold=min_size)
+    return cleaned.astype(np.float32) * matte
+
+
+def clean_thin_hairs(matte, threshold=0.3, max_thickness=3):
+    binary = matte > threshold
+    skeleton = morphology.skeletonize(binary)
+    distance = distance_transform_edt(binary)
+    thin_structures = (distance <= max_thickness) & skeleton
+    matte_clean = matte.copy()
+    matte_clean[thin_structures] = 0
+    matte_clean = cv2.GaussianBlur(matte_clean, (5, 5), 0)
+    return np.clip(matte_clean, 0, 1)
+
+def clean_alpha_mask(pha):
+    pha = np.clip(pha * 1.15, 0, 1)
+    pha_binary = (pha > 0.7).astype(np.float32)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((pha_binary * 255).astype(np.uint8), connectivity=8)
+    clean_mask = np.zeros_like(pha_binary)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] > 1000:
+            clean_mask[labels == i] = 1.0
+    clean_mask = cv2.GaussianBlur(clean_mask, (7,7), 0)
+    clean_mask = np.clip(clean_mask, 0, 1)
+
+    return clean_mask
+
+
+
+
 def apply_studio_editing(image: Image):
-    # Enhance brightness and contrast
     enhancer = ImageEnhance.Brightness(image)
-    image = enhancer.enhance(1.1)  # Increase brightness by 10%
+    image = enhancer.enhance(1.1)
 
-    enhancer = ImageEnhance.Contrast(image) #1.1
-    image = enhancer.enhance(1.0)  # Increase contrast by 20%
-
-    # Sharpen the image
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.0)  
     enhancer = ImageEnhance.Sharpness(image)
-    image = enhancer.enhance(1.8)  # Increase sharpness
-
-    # Reduce noise
+    image = enhancer.enhance(1.8)
     image = image.filter(ImageFilter.SMOOTH_MORE)
-
-    # Adjust saturation
-    enhancer = ImageEnhance.Color(image) #(1.1)
-    image = enhancer.enhance(1.0)  # Increase saturation by 10%
+    enhancer = ImageEnhance.Color(image)
+    image = enhancer.enhance(1.0)
 
     return image
 
 def align_face(image, landmarks):
-    # Align the face based on eye positions (basic alignment)
     angle = np.degrees(np.arctan2(0, 0))
     return image.rotate(angle, resample=Image.BICUBIC, expand=True)
 
+def refine_hair_edges(image):
+    img_array = np.array(image)
+    if img_array.shape[2] != 4:
+        raise ValueError("Image must have 4 channels (RGBA)")
+
+    rgb = img_array[:, :, :3]
+    alpha = img_array[:, :, 3]
+    white_bg = np.full_like(rgb, 255)
+    alpha_norm = alpha.astype(np.float32) / 255.0
+    comp_rgb = (rgb * alpha_norm[..., None] + white_bg * (1 - alpha_norm[..., None])).astype(np.uint8)
+    lab = cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2LAB)
+    lightness = lab[:, :, 0]
+    blurred = cv2.GaussianBlur(lightness, (5, 5), 0)
+    edges = cv2.Canny(blurred, 20, 50)
+    _, mask_light = cv2.threshold(lightness, 180, 255, cv2.THRESH_BINARY)
+    _, mask_dark = cv2.threshold(lightness, 70, 255, cv2.THRESH_BINARY_INV)
+    stray_zone = cv2.bitwise_or(mask_light, mask_dark)
+    h, w = lightness.shape
+    top_mask = np.zeros_like(lightness)
+    top_h = int(h * 0.4)
+    top_mask[:top_h, :] = 255
+    side_w = int(w * 0.15)
+    top_mask[:, :side_w] = 255
+    top_mask[:, -side_w:] = 255
+    stray_edges = cv2.bitwise_and(edges, stray_zone)
+    stray_top = cv2.bitwise_and(stray_edges, top_mask)
+    dense_hair = cv2.inRange(lightness, 40, 160)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    dense_hair = cv2.morphologyEx(dense_hair, cv2.MORPH_CLOSE, kernel, iterations=2)
+    stray_top = cv2.bitwise_and(stray_top, cv2.bitwise_not(dense_hair))
+    kernel_small = np.ones((2, 2), np.uint8)
+    stray_top = cv2.dilate(stray_top, kernel_small, iterations=1)
+    stray_top = cv2.morphologyEx(stray_top, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    feather_mask = cv2.GaussianBlur(stray_top, (9, 9), 0)
+    feather_mask = cv2.normalize(feather_mask, None, 0, 255, cv2.NORM_MINMAX)
+    blend_factor = (feather_mask.astype(np.float32) / 255.0)[:, :, None]
+    new_alpha = (alpha * (1 - blend_factor.squeeze() * 0.7)).astype(np.uint8)
+    result = np.dstack((rgb, new_alpha))
+    
+    return Image.fromarray(result)
+
 def calculate_face_position(cropped_face, landmarks):
-    """
-    Calculate the position of the face and eyes to ensure they meet passport requirements.
-    """
-    # Get the dimensions of the cropped face
     face_height = cropped_face.height
     face_width = cropped_face.width
-
-    # Calculate eye position (assuming landmarks are available)
     left_eye = landmarks['left_eye']
     right_eye = landmarks['right_eye']
     eye_center_y = (left_eye[1] + right_eye[1]) // 2
-
-    # Calculate head height (from top of head to chin)
     head_height = face_height
-
-    # Ensure head height is between 25.4 mm and 35 mm
-    # Convert mm to pixels (assuming 300 DPI: 1 mm = 11.81 pixels)
     min_head_height_px = int(25.4 * 11.81)
     max_head_height_px = int(35 * 11.81)
-
-    # Resize the face to ensure head height is within the required range
     if head_height < min_head_height_px or head_height > max_head_height_px:
         scaling_factor = min_head_height_px / head_height if head_height < min_head_height_px else max_head_height_px / head_height
         new_height = int(face_height * scaling_factor)
@@ -218,13 +563,12 @@ def calculate_face_position(cropped_face, landmarks):
     return cropped_face
 
 def feather_edges(image):
-    # Create a mask from the alpha channel
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image)
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
     mask = image.split()[3]
-
-    # Apply Gaussian blur to the mask
     blurred_mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
-
-    # Paste the image onto a new background using the blurred mask
     feathered_image = Image.new("RGBA", image.size, (255, 255, 255, 0))
     feathered_image.paste(image, (0, 0), blurred_mask)
 
@@ -232,59 +576,31 @@ def feather_edges(image):
 
 
 def smooth_edges(image):
-    # Convert PIL image to OpenCV format
     image_cv = np.array(image)
     image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
-
-    # Convert to grayscale
     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-
-    # Apply Gaussian blur to smooth edges
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # Threshold to create a mask
     _, mask = cv2.threshold(blurred, 1, 255, cv2.THRESH_BINARY)
-
-    # Find contours
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    # Create a mask with smoothed edges
     smoothed_mask = np.zeros_like(mask)
     cv2.drawContours(smoothed_mask, contours, -1, 255, thickness=cv2.FILLED)
-
-    # Apply morphological operations to clean up the mask
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     smoothed_mask = cv2.morphologyEx(smoothed_mask, cv2.MORPH_CLOSE, kernel)
     smoothed_mask = cv2.morphologyEx(smoothed_mask, cv2.MORPH_OPEN, kernel)
-
-    # Apply the mask to the original image
     result = cv2.bitwise_and(image_cv, image_cv, mask=smoothed_mask)
-
-    # Convert back to PIL format
     result_pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
 
     return result_pil
 
 def remove_shadows_clahe(image):
-    # Convert PIL image to OpenCV format
     image_cv = np.array(image)
     image_cv = cv2.cvtColor(image_cv, cv2.COLOR_RGB2BGR)
-
-    # Convert to LAB color space
     lab = cv2.cvtColor(image_cv, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-
-    # Apply CLAHE to the L channel
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_clahe = clahe.apply(l)
-
-    # Merge the CLAHE-enhanced L channel back with the A and B channels
     lab_clahe = cv2.merge((l_clahe, a, b))
-
-    # Convert back to BGR color space
     result = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-
-    # Convert back to PIL format
     result_pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
 
     return result_pil
@@ -293,16 +609,12 @@ def apply_studio(image):
 
     img_array = np.array(image.convert("RGB"))
     smooth = cv2.bilateralFilter(img_array, d=9, sigmaColor=75, sigmaSpace=75)
-
-    # Step 2: Increase brightness & contrast slightly
     lab = cv2.cvtColor(smooth, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     enhanced = cv2.merge((l, a, b))
     enhanced = cv2.cvtColor(enhanced, cv2.COLOR_LAB2RGB)
-
-    # Step 3: Slight sharpening (to pop eyes/lips)
     sharpen_kernel = np.array([[0, -1, 0],
                                [-1, 5, -1],
                                [0, -1, 0]])
@@ -317,62 +629,74 @@ def remove_hair_feathers(image):
 
     rgb = img_array[:, :, :3]
     alpha = img_array[:, :, 3]
-
-    # Composite over white for realistic processing
     white_bg = np.full_like(rgb, 255)
     alpha_norm = alpha.astype(np.float32) / 255.0
     comp_rgb = (rgb * alpha_norm[..., None] + white_bg * (1 - alpha_norm[..., None])).astype(np.uint8)
-
-    # Grayscale and light blur
     gray = cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    # Softer edge detection
     edges = cv2.Canny(blurred, 15, 60)
-
-    # Detect light and slightly dark stray hair regions
     mask_light = cv2.inRange(gray, 150, 255)
     mask_dark = cv2.inRange(gray, 60, 150)
     stray_zone = cv2.bitwise_or(mask_light, mask_dark)
-
-    # Focus on top of head
     h, w = gray.shape
     top_mask = np.zeros_like(gray)
     top_h = int(h * 0.3)
     top_mask[:top_h, :] = 255
     stray_top = cv2.bitwise_and(edges, stray_zone)
     stray_top = cv2.bitwise_and(stray_top, top_mask)
-
-    # Remove dense/solid hair regions
     dense_hair_mask = cv2.inRange(gray, 50, 130)
     stray_top = cv2.bitwise_and(stray_top, cv2.bitwise_not(dense_hair_mask))
-
-    # Smooth the mask
     kernel = np.ones((3, 3), np.uint8)
     stray_top = cv2.dilate(stray_top, kernel, iterations=1)
     stray_top = cv2.morphologyEx(stray_top, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    # Large feathering for smooth blending
-    feather = cv2.GaussianBlur(stray_top, (7, 7), 0)
-    blend_mask = (feather.astype(np.float32) / 255.0)[:, :, None]  # shape (h, w, 1)
-
-     # Step 4: Studio blend — fade slightly toward white
-    # white_fade = (comp_rgb * (1 - blend_mask) + 255 * blend_mask).astype(np.uint8)
+    feather = cv2.GaussianBlur(stray_top, (11, 11), 0)
+    blend_mask = (feather.astype(np.float32) / 255.0)[:, :, None]
     new_alpha = (alpha * (1 - blend_mask.squeeze())).astype(np.uint8)
-
-    # Step 5: Restore alpha channel
     result = np.dstack((rgb, new_alpha))
-    # result = np.dstack((blended_rgb, alpha))
 
+    return Image.fromarray(result)
+
+def smooth_hair_blending(image):
+    img_array = np.array(image)
+    if img_array.shape[2] != 4:
+        raise ValueError("Image must have 4 channels (RGBA)")
+
+    rgb = img_array[:, :, :3]
+    alpha = img_array[:, :, 3]
+    white_bg = np.full_like(rgb, 255)
+    alpha_norm = alpha.astype(np.float32) / 255.0
+    comp_rgb = (rgb * alpha_norm[..., None] + white_bg * (1 - alpha_norm[..., None])).astype(np.uint8)
+    gray = cv2.cvtColor(comp_rgb, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 15, 60)
+    mask_light = cv2.inRange(gray, 150, 255)
+    mask_dark = cv2.inRange(gray, 60, 150)
+    stray_zone = cv2.bitwise_or(mask_light, mask_dark)
+    h, w = gray.shape
+    top_mask = np.zeros_like(gray)
+    top_h = int(h * 0.24)
+    top_mask[:top_h, :] = 255
+    stray_top = cv2.bitwise_and(edges, stray_zone)
+    stray_top = cv2.bitwise_and(stray_top, top_mask)
+    dense_hair_mask = cv2.inRange(gray, 50, 130)
+    stray_top = cv2.bitwise_and(stray_top, cv2.bitwise_not(dense_hair_mask))
+    kernel = np.ones((3, 3), np.uint8)
+    stray_top = cv2.dilate(stray_top, kernel, iterations=1)
+    stray_top = cv2.morphologyEx(stray_top, cv2.MORPH_CLOSE, kernel, iterations=1)
+    feather = cv2.GaussianBlur(stray_top, (37, 37), 0)
+    blend_mask = (feather.astype(np.float32) / 255.0)[:, :, None]
+    blend_strength = 0.6
+    blend_mask = np.clip(blend_mask, 0, blend_strength)
+    blended_rgb = (rgb * (1 - blend_mask) + 255 * blend_mask).astype(np.uint8)
+    new_alpha = (alpha * (1 - blend_mask.squeeze()) + 255 * blend_mask.squeeze() * 0.02).astype(np.uint8)
+    result = np.dstack((blended_rgb, new_alpha))
     return Image.fromarray(result)
  
 
 @app.post("/convert-heic-to-jpeg")
 async def convert_heic_to_jpeg(file: UploadFile = File(...)):
     try:
-         # Check if file is already JPEG
         if file.filename.lower().endswith(('.jpg', '.jpeg')):
-            # Just return the original file content
             image = Image.open(file.file)
             image = ImageOps.exif_transpose(image)
             if(image.width > 1200 and image.height > 1600):
@@ -386,23 +710,15 @@ async def convert_heic_to_jpeg(file: UploadFile = File(...)):
                 media_type="image/jpeg",
                 status_code=200
             )
-        
-        # Only convert if it's HEIC
         image = Image.open(file.file)
         image = ImageOps.exif_transpose(image)
         if(image.width > 1200 and image.height > 1600):
             image = ImageOps.fit(image, (1200,1600), Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-        
-        # Convert to RGB if needed (HEIC might be in other modes)
         if image.mode != 'RGB':
             image = image.convert("RGB")
-        
-        # Save as JPEG in memory
         img_bytes = io.BytesIO()
         image.save(img_bytes, format="JPEG", quality=100)
         img_bytes.seek(0)
-
-        # Return JPEG file as response
         return Response(
             content=img_bytes.getvalue(),
             media_type="image/jpeg",
@@ -421,142 +737,103 @@ def smooth_skin(pil_img):
     smoothed = cv2.addWeighted(img_np, 0.8, blurred, 0.2, 0)
     return Image.fromarray(smoothed)
 
-def get_makepassport_crop_coords(image, landmarks,  extra_bottom_pad_ratio=0.2,
-                            reduce_top_pad_ratio=0.1):
-    """
-    Exact passport photo cropping logic matching MakePassport.com
-    Returns (x1, y1, x2, y2) cropping coordinates
-    """
-    # Get face dimensions
+def get_tight_passport_crop(image, landmarks, target_head_ratio=0.63,
+                          eye_level_ratio=0.43, final_size=600,
+                          min_zoom=1.0, max_zoom=1.5):
     width, height = image.size
-    face_width = landmarks['box'][2]
-    face_height = landmarks['box'][3]
-    
-    # MakePassport.com's proprietary padding formula
-    top_padding = int(face_height * 0.45 * (1 - reduce_top_pad_ratio) * 1.1)  # Forehead space
-    bottom_padding = int(face_height * 0.6 *(1 + extra_bottom_pad_ratio) * 1.1)  # Chin to shoulder
-    side_padding = int(face_width * 0.75 * 1.1)   # Side space
-    
-    # Calculate crop coordinates
-    x1 = max(0, landmarks['box'][0] - side_padding)
-    x2 = min(width, landmarks['box'][0] + landmarks['box'][2] + side_padding)
-    
-    # Special vertical positioning (eyes at 45% from top)
-    eye_level = landmarks['keypoints']['left_eye'][1]  # Use left eye y-position
-    y1 = max(0, eye_level - int(top_padding * 1.1))  # Adjusted forehead ratio
-    y2 = min(height, eye_level + int(bottom_padding * 0.9))  # Shoulder position
-    
-    # Ensure 1:1 aspect ratio (passport requirement)
-    crop_width = x2 - x1
-    crop_height = y2 - y1
-    
-    if crop_width > crop_height:
-        # Expand vertical
-        diff = crop_width - crop_height
-        y1 = max(0, y1 - diff//2)
-        y2 = min(height, y2 + diff//2)
-    else:
-        # Expand horizontal
-        diff = crop_height - crop_width
-        x1 = max(0, x1 - diff//2)
-        x2 = min(width, x2 + diff//2)
-    
-    return (x1, y1, x2, y2)
+    face_x, face_y, face_w, face_h = landmarks['box']
+    chin_y = face_y + face_h
+    eye_y = (landmarks['keypoints']['left_eye'][1] + landmarks['keypoints']['right_eye'][1]) // 2
+    top_of_head_y = face_y - int(face_h * 0.2)
+    actual_head_height = chin_y - top_of_head_y
+    desired_head_height_pixels = final_size * target_head_ratio
+    scale = desired_head_height_pixels / actual_head_height
+    shoulder_width = face_w * 1.7
+    body_height = chin_y - top_of_head_y + (chin_y - top_of_head_y) * 0.5
+    cx = face_x + face_w // 2
+    crop_width = shoulder_width
+    crop_height = body_height
+    width_zoom = final_size / (crop_width * scale)
+    height_zoom = final_size / (crop_height * scale)
+    required_zoom = max(width_zoom, height_zoom)
+    zoom_factor = min(max(min_zoom, required_zoom), max_zoom)
+    scaled_crop_width = crop_width * zoom_factor
+    scaled_crop_height = crop_height * zoom_factor
+    crop_x1 = cx - scaled_crop_width / 2
+    crop_x2 = cx + scaled_crop_width / 2
+    crop_y1 = eye_y - (eye_level_ratio * scaled_crop_height)
+    crop_y2 = crop_y1 + scaled_crop_height
+    crop_x1 = max(0, crop_x1)
+    crop_y1 = max(0, crop_y1)
+    crop_x2 = min(width, crop_x2)
+    crop_y2 = min(height, crop_y2)
+    if crop_x2 - crop_x1 < scaled_crop_width or crop_y2 - crop_y1 < scaled_crop_height:
+        actual_width = crop_x2 - crop_x1
+        actual_height = crop_y2 - crop_y1
+        width_zoom = final_size / (actual_width * scale)
+        height_zoom = final_size / (actual_height * scale)
+        zoom_factor = min(max(min_zoom, min(width_zoom, height_zoom)), max_zoom)
+        scaled_crop_width = crop_width * zoom_factor
+        scaled_crop_height = crop_height * zoom_factor
+        crop_x1 = max(0, cx - scaled_crop_width / 2)
+        crop_x2 = min(width, cx + scaled_crop_width / 2)
+        crop_y1 = max(0, eye_y - (eye_level_ratio * scaled_crop_height))
+        crop_y2 = min(height, crop_y1 + scaled_crop_height)
 
-
+    return (int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2))
 
 @app.post("/process-image")
 async def process_image(file: UploadFile = File(...)):
     try:
-        # Read image
         image_bytes = await file.read()
         input_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-        # Convert image to a NumPy array with dtype uint8
         input_array = np.array(input_image, dtype=np.uint8)
+        result = modelFace.get(input_array)
+        if len(result) == 0:
+            return JSONResponse(content={"error":"No face detected"}, status_code=400)
+        elif len(result) > 1:
+            return JSONResponse(content={"error": "Multiple faces detected"}, status_code=401)
 
-        # Detect face using MTCNN
-        result = face_detector.detect_faces(input_array)
-        if not result:
-            return Response(content="No face detected", status_code=400)
-
-        # Extract the first detected face and landmarks
-        # box = result[0]['box']
-        # landmarks = result[0]['keypoints']
-        # x1, y1, width, height = box
-        # x2, y2 = x1 + width, y1 + height
-
-        x1, y1, x2, y2 = get_makepassport_crop_coords(input_image, result[0])
-        cropped_face = input_image.crop((x1, y1, x2, y2))
-
-        # # # Add padding (extra space for passport photo)
-        # # padding_x = int(width * 0.75)
-        # # padding_y = int(height * 0.45)
-        # # padding_y_bottom = int(height * 0.5)  # Extra padding below the face to include bod
-        # face_width_ratio = width / input_image.width
-        # face_height_ratio = height / input_image.height
-
-        # # Adjust padding dynamically based on face proportions and position in the image
-        # padding_x = int(width * ((0.75 if face_width_ratio < 0.2 else 1.1-face_width_ratio)))  # Reduce padding if the face is too wide
-        # padding_y = int(height * ((0.55 if face_height_ratio <0.3 else 0.45)))  # Adjust forehead space
-        # padding_y_bottom = int(height * (0.6 if face_height_ratio > 0.7 else 0.5))  # Adjust body space
-        # Face-to-image ratios
-        # Calculate face-to-image ratios
-        # face_width_ratio = width / input_image.width
-        # face_height_ratio = height / input_image.height
-
-        # # Conservative, uniform padding that avoids oversized face framing
-        # padding_x = int(width * 0.6 if face_width_ratio < 0.3 else width * 0.4)
-        # padding_y = int(height * 0.4 if face_height_ratio < 0.4 else height * 0.35)
-        # padding_y_bottom = int(height * 0.45 if face_height_ratio > 0.6 else height * 0.4)
-
-
-        # x1 = max(0, x1 - padding_x)
-        # x2 = min(input_image.width, x2 + padding_x)
-        # y1 = max(0, y1 - padding_y)
-        # y2 = min(input_image.height, y2 + padding_y_bottom)
-
-        # # Crop the face region
-        # cropped_face = input_image.crop((x1, y1, x2, y2))
-
-        # Ensure face and eye positioning meet passport requirements
-        # cropped_face = calculate_face_position(cropped_face, landmarks)
-
-        # Remove background using Rembg
-        no_bg_image = remove(cropped_face)
-
-        # Smooth edges to remove shadows
+        cropped_face = get_uk_passport_crop(input_array, result[0])
+        # no_bg_image = remove_bg_rvm_cpu(Image.fromarray(cropped_face))
+        no_bg_image = remove_bg_modnet(Image.fromarray(cropped_face))
         smoothed_image = feather_edges(no_bg_image)
-
-        no_hair_image = remove_hair_feathers(smoothed_image)
-        
-
-        # Resize to passport size (600x600 pixels for 2x2 inches at 300 DPI)
-        face_resized = no_hair_image.resize((1200, 1200), Image.LANCZOS)
-        face_resized = face_resized.filter(ImageFilter.UnsharpMask(radius=2, percent=120, threshold=2))
-        # face_resized_np = cv2.resize(np.array(smoothed_image), (1200, 1200), interpolation=cv2.INTER_CUBIC)
-        # face_resized = Image.fromarray(face_resized_np)
-
-        # Create a passport-size background (white)
+        no_hair_image = smooth_hair_blending(smoothed_image)
+        face_resized = no_hair_image
         white_background = (255, 255, 255)
         passport_background = Image.new("RGB", (1200, 1200), white_background)
-
-        # Center the face on the background
         paste_x = (1200 - face_resized.width) // 2
         paste_y = (1200 - face_resized.height) // 2
-
         face_resized = face_resized.convert("RGBA")
-        
         passport_background.paste(face_resized, (paste_x, paste_y), face_resized.split()[3])
-
-        # passport_background = passport_background.filter(ImageFilter.UnsharpMask(radius=2, percent=170, threshold=3))
-
-        # Apply studio-like enhancements
+        passport_background=passport_background.resize((1200, 1200), Image.LANCZOS)
         passport_background = apply_studio_editing(passport_background)
-
-        # Convert image to bytes
+        no_bg_image_np = np.array(passport_background)[:, :, ::-1]
+        _, _, restored_img = gfpgan_model.enhance(
+            no_bg_image_np, 
+            has_aligned=False, 
+            only_center_face=False, 
+            paste_back=True,
+            weight=0.3
+        )
+        original_h, original_w = no_bg_image_np.shape[:2]
+        if isinstance(restored_img, list):
+            restored_img = restored_img[0]
+        if restored_img.shape != no_bg_image_np.shape:
+            restored_img = cv2.resize(
+                restored_img,
+                (original_w, original_h), 
+                interpolation=cv2.INTER_LANCZOS4  
+            )
+        # alpha = 0.5 
+        # natural_result = cv2.addWeighted(
+        #     no_bg_image_np, alpha,
+        #     restored_img, 1 - alpha,
+        #     0
+        # )
+        enhanced_img = Image.fromarray(cv2.cvtColor(restored_img, cv2.COLOR_BGR2RGB))
         img_byte_arr = io.BytesIO()
-        passport_background.save(img_byte_arr, format="PNG", quality=100, dpi=(300, 300))
+        enhanced_img.save(img_byte_arr, format="PNG", quality=100, dpi=(300, 300))
         img_byte_arr.seek(0)
 
         return Response(content=img_byte_arr.getvalue(), media_type="image/png", status_code=200)
@@ -569,15 +846,10 @@ async def process_image(file: UploadFile = File(...)):
 @app.post("/remove-bg")
 async def remove_bg(file: UploadFile = File(...)):
     try:
-        # Read input image
         input_image = Image.open(io.BytesIO(await file.read()))
         input_array = np.array(input_image)
-
-        # Remove background
         output_array = remove.remove(input_array)
         output_image = Image.fromarray(output_array)
-
-        # Convert image to bytes
         img_io = io.BytesIO()
         output_image.save(img_io, format="PNG")
         img_io.seek(0)
